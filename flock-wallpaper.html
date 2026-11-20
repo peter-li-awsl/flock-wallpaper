@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鸟群动态壁纸</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+<canvas aria-label="会避开鼠标的绿色鸟群"></canvas>
+<script>
+"use strict";
+
+// Match the flock in bios.py, with the flight area fitted to the desktop.
+const HEIGHT = 800;
+const DEPTH = 500;
+const FOCAL = 450;
+const BIRD_COUNT = 300;
+const STEP = 1 / 30;
+const PERCEPTION = 120;
+const CELL = PERCEPTION * 1.1;
+const VIEW_COS = Math.cos(150 * Math.PI / 180);
+const NEIGHBOR_COUNT = 7;
+const ROUTE_GROUPS = 3;
+const ROUTE_INTERVAL = 4.5;
+const ROUTE_TRANSITION = 1;
+const MOUSE_RADIUS = 110;
+const DOT_MIN = 2;
+const DOT_MAX = 3;
+const FAR_SCALE = FOCAL / (FOCAL + DEPTH);
+const seed = Math.floor(Math.random() * 1_000_000);
+
+const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+const random = (low, high) => low + (high - low) * Math.random();
+const vec = (x = 0, y = 0, z = 0) => ({ x, y, z });
+const add = (a, b) => vec(a.x + b.x, a.y + b.y, a.z + b.z);
+const subtract = (a, b) => vec(a.x - b.x, a.y - b.y, a.z - b.z);
+const scale = (a, m) => vec(a.x * m, a.y * m, a.z * m);
+const dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
+const length = a => Math.sqrt(dot(a, a));
+const mix = (a, b, t) => a + (b - a) * t;
+const lerp = (a, b, t) => vec(mix(a.x, b.x, t), mix(a.y, b.y, t), mix(a.z, b.z, t));
+
+function unit(a) {
+  const magnitude = length(a);
+  return magnitude > 1e-8 ? scale(a, 1 / magnitude) : vec(1);
+}
+
+function limit(a, maximum) {
+  const squared = dot(a, a);
+  return squared > maximum * maximum ? scale(a, maximum / Math.sqrt(squared)) : a;
+}
+
+function noiseSample(index, series) {
+  let bits = (Math.imul(index, 374761393) + Math.imul(series, 668265263)) | 0;
+  bits = Math.imul(bits ^ (bits >>> 13), 1274126177);
+  return ((bits ^ (bits >>> 16)) >>> 0) / 2147483647.5 - 1;
+}
+
+function smoothNoise(value, series) {
+  const index = Math.floor(value);
+  const t = value - index;
+  const blend = t ** 3 * (t * (t * 6 - 15) + 10);
+  return mix(noiseSample(index, series), noiseSample(index + 1, series), blend);
+}
+
+function routeTarget(width, time, group) {
+  const index = Math.floor(time / ROUTE_INTERVAL);
+  const t = clamp((time - index * ROUTE_INTERVAL) / ROUTE_TRANSITION, 0, 1);
+  const blend = t * t * (3 - 2 * t);
+  const series = seed + group * 101;
+  const coordinate = offset => mix(noiseSample(index - 1, series + offset),
+                                   noiseSample(index, series + offset), blend);
+  const z = DEPTH * (0.5 + 0.3 * coordinate(13));
+  const perspective = FOCAL / (FOCAL + z);
+  return vec(width / 2 + width * 0.38 * coordinate(11) / perspective,
+             HEIGHT / 2 + HEIGHT * 0.38 * coordinate(12) / perspective, z);
+}
+
+function flowForce(position, time) {
+  const t = time / 3.5;
+  const local = (position.x * 0.65 + position.y * 0.35) / 360;
+  return scale(vec(
+    smoothNoise(t, seed) + 0.45 * smoothNoise(t * 0.8 + local, seed + 1),
+    smoothNoise(t, seed + 2) + 0.45 * smoothNoise(t * 0.8 - local, seed + 3),
+    0.24 * smoothNoise(t * 0.7 + local * 0.4, seed + 4)
+  ), 75);
+}
+
+function project(position, width) {
+  const perspective = FOCAL / (FOCAL + position.z);
+  return {
+    x: width / 2 + (position.x - width / 2) * perspective,
+    y: HEIGHT / 2 + (position.y - HEIGHT / 2) * perspective,
+    perspective
+  };
+}
+
+function createBird(width) {
+  const z = random(25, DEPTH - 25);
+  const perspective = FOCAL / (FOCAL + z);
+  const position = vec(width / 2 + random(-0.40, 0.40) * width / perspective,
+                       HEIGHT / 2 + random(-0.39, 0.39) * HEIGHT / perspective, z);
+  const cruise = 170 * random(0.9, 1.1);
+  const heading = unit(vec(1, -0.15 + random(-0.18, 0.18), random(-0.12, 0.12)));
+  return {
+    position, previous: position, cruise, velocity: scale(heading, cruise), acceleration: vec(),
+    spacing: 32 * random(0.92, 1.08), range: PERCEPTION * random(0.92, 1.08),
+    separationWeight: 1.5 * random(0.9, 1.1), alignmentWeight: 1.1 * random(0.9, 1.1),
+    cohesionWeight: 0.38 * random(0.9, 1.1), drift: random(4, 8),
+    phase: random(0, Math.PI * 2), turnBias: Math.random() < 0.5 ? -1 : 1,
+    group: Math.floor(Math.random() * ROUTE_GROUPS)
+  };
+}
+
+function avoidance(force, velocity, turnBias) {
+  const strength = length(force);
+  if (dot(force, velocity) < -0.8 * strength * length(velocity)) {
+    const side = vec(velocity.y, -velocity.x);
+    const turn = dot(side, side) > 1e-8 ? side : vec(-velocity.z, 0, velocity.x);
+    return add(force, scale(unit(turn), strength * 0.8 * turnBias));
+  }
+  return force;
+}
+
+function boundaryForce(bird, width) {
+  const { position, velocity, turnBias } = bird;
+  const predicted = add(position, scale(velocity, 0.45));
+  predicted.z = Math.max(-FOCAL / 2, predicted.z);
+  const view = project(predicted, width);
+  function inward(coordinate, extent, margin) {
+    const near = clamp((margin - coordinate) / margin, 0, 2);
+    const far = clamp((coordinate - extent + margin) / margin, 0, 2);
+    return 950 * (near * near - far * far);
+  }
+  return avoidance(vec(inward(view.x, width, 45) / view.perspective,
+                       inward(view.y, HEIGHT, 45) / view.perspective,
+                       inward(position.z + velocity.z, DEPTH, 75)), velocity, turnBias);
+}
+
+function wallUrgency(position, velocity, view, width) {
+  const depthRate = velocity.z / (FOCAL + position.z);
+  function outward(coordinate, speed, extent) {
+    const movingOut = coordinate < extent / 2 ? speed < 0 : speed > 0;
+    return movingOut ? clamp(1 - Math.min(coordinate, extent - coordinate) / 100, 0, 1) : 0;
+  }
+  return Math.max(
+    outward(view.x, view.perspective * velocity.x - (view.x - width / 2) * depthRate, width),
+    outward(view.y, view.perspective * velocity.y - (view.y - HEIGHT / 2) * depthRate, HEIGHT),
+    outward(position.z, velocity.z, DEPTH)
+  );
+}
+
+function cellOf(position) {
+  return [Math.floor(position.x / CELL), Math.floor(position.y / CELL),
+          Math.floor(position.z / CELL)];
+}
+
+function findNeighbors(birds, headings) {
+  const cells = new Map();
+  const cellsByBird = birds.map((bird, index) => {
+    const cell = cellOf(bird.position);
+    const key = cell.join(',');
+    if (!cells.has(key)) cells.set(key, []);
+    cells.get(key).push(index);
+    return cell;
+  });
+  const candidates = new Map();
+  const nearest = birds.map(() => []);
+  const separation = birds.map(() => vec());
+  birds.forEach((bird, i) => {
+    const [x, y, z] = cellsByBird[i];
+    const key = cellsByBird[i].join(',');
+    if (!candidates.has(key)) {
+      const indices = [];
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dz = -1; dz <= 1; dz++) {
+            const cell = cells.get(`${x + dx},${y + dy},${z + dz}`);
+            if (cell) indices.push(...cell);
+          }
+        }
+      }
+      candidates.set(key, indices);
+    }
+    for (const j of candidates.get(key)) {
+      if (j <= i) continue;
+      const other = birds[j];
+      const delta = subtract(other.position, bird.position);
+      const squared = dot(delta, delta);
+      if (squared > Math.max(bird.range, other.range) ** 2) continue;
+      if (squared < 1e-10) {
+        const angle = bird.phase + other.phase;
+        const offset = vec(Math.cos(angle), Math.sin(angle));
+        separation[i] = add(separation[i], offset);
+        separation[j] = subtract(separation[j], offset);
+        continue;
+      }
+      const distance = Math.sqrt(squared);
+      if (distance < bird.spacing) {
+        separation[i] = subtract(separation[i], scale(delta, (1 - distance / bird.spacing) ** 2 / distance));
+      }
+      if (distance < other.spacing) {
+        separation[j] = add(separation[j], scale(delta, (1 - distance / other.spacing) ** 2 / distance));
+      }
+      if (distance < bird.range && dot(headings[i], delta) >= VIEW_COS * distance) {
+        nearest[i].push({ index: j, squared });
+      }
+      if (distance < other.range && -dot(headings[j], delta) >= VIEW_COS * distance) {
+        nearest[j].push({ index: i, squared });
+      }
+    }
+  });
+  return { nearest, separation };
+}
+
+function stepFlock(birds, width, time, mouse) {
+  const headings = birds.map(bird => unit(bird.velocity));
+  const { nearest, separation } = findNeighbors(birds, headings);
+  const routes = Array.from({ length: ROUTE_GROUPS }, (_, group) => routeTarget(width, time, group));
+  const next = birds.map((bird, i) => {
+    const { position, velocity, turnBias, phase } = bird;
+    const heading = headings[i];
+    const speed = length(velocity);
+    let force = avoidance(scale(separation[i], 500 * bird.separationWeight), velocity, turnBias);
+    const neighbors = nearest[i].sort((a, b) => a.squared - b.squared).slice(0, NEIGHBOR_COUNT);
+    if (neighbors.length) {
+      let meanVelocity = vec();
+      let centerOffset = vec();
+      for (const { index } of neighbors) {
+        meanVelocity = add(meanVelocity, birds[index].velocity);
+        centerOffset = add(centerOffset, subtract(birds[index].position, position));
+      }
+      const alignment = subtract(scale(meanVelocity, 1 / neighbors.length), velocity);
+      const cohesion = limit(scale(centerOffset, 1.4 / neighbors.length), 60);
+      force = add(force, scale(alignment, bird.alignmentWeight / 0.45));
+      force = add(force, scale(cohesion, bird.cohesionWeight));
+    }
+    force = add(force, flowForce(position, time));
+    force = add(force, limit(scale(subtract(routes[bird.group], position), 0.9), 200));
+    force = add(force, scale(vec(Math.sin(time * 0.7 + phase), Math.cos(time * 0.6 + phase),
+                                 0.5 * Math.sin(time * 0.5 + phase)), bird.drift));
+    const walls = boundaryForce(bird, width);
+    const wallWeight = Math.min(1, length(walls) / 320);
+    force = add(scale(limit(force, 208), 1 - wallWeight), walls);
+
+    const view = project(position, width);
+    let alarm = 0;
+    if (mouse) {
+      const away = vec(view.x - mouse.x, view.y - mouse.y);
+      const distance = length(away);
+      if (distance < MOUSE_RADIUS) {
+        alarm = (1 - distance / MOUSE_RADIUS) ** 2;
+        const direction = distance > 1e-8 ? unit(away) : scale(heading, -1);
+        force = add(force, avoidance(scale(direction, 850 * alarm / view.perspective), velocity, turnBias));
+      }
+    }
+
+    const urgency = Math.max(alarm, wallUrgency(position, velocity, view, width));
+    const turnRate = mix(110, 180, urgency) * Math.PI / 180;
+    const lateralLimit = Math.min(mix(320, 600, urgency), Math.max(speed, 1) * turnRate);
+    const lateral = subtract(force, scale(heading, dot(force, heading)));
+    const response = 0.18 * (1 - 0.55 * urgency);
+    let acceleration = lerp(bird.acceleration, limit(lateral, lateralLimit), 1 - Math.exp(-STEP / response));
+    acceleration = limit(subtract(acceleration, scale(heading, dot(acceleration, heading))), lateralLimit);
+    const targetSpeed = bird.cruise * (1 + 0.08 * alarm);
+    const nextSpeed = mix(targetSpeed, speed, Math.exp(-STEP / 0.8));
+    const nextHeading = unit(add(heading, scale(acceleration, STEP / Math.max(speed, 1))));
+    const nextVelocity = scale(nextHeading, nextSpeed);
+    const nextPosition = add(position, scale(add(velocity, nextVelocity), STEP / 2));
+    return { previous: position, position: nextPosition, velocity: nextVelocity, acceleration };
+  });
+  birds.forEach((bird, i) => Object.assign(bird, next[i]));
+}
+
+const canvas = document.querySelector('canvas');
+const context = canvas.getContext('2d', { alpha: false });
+let width = 0;
+let birds = [];
+let pointer = null;
+let avoidPointer = true;
+let time = 0;
+let accumulator = 0;
+let lastFrame = null;
+
+function resize() {
+  const cssWidth = Math.max(1, canvas.clientWidth);
+  const cssHeight = Math.max(1, canvas.clientHeight);
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(cssWidth * ratio);
+  canvas.height = Math.round(cssHeight * ratio);
+  const newWidth = HEIGHT * cssWidth / cssHeight;
+  if (birds.length) {
+    for (const bird of birds) {
+      const position = vec(bird.position.x * newWidth / width, bird.position.y, bird.position.z);
+      bird.position = bird.previous = position;
+    }
+  } else {
+    birds = Array.from({ length: BIRD_COUNT }, () => createBird(newWidth));
+  }
+  width = newWidth;
+}
+
+function draw(alpha) {
+  context.fillStyle = '#000';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  const xScale = canvas.width / width;
+  const yScale = canvas.height / HEIGHT;
+  const dotScale = Math.max(1, canvas.height / HEIGHT);
+  const sorted = [...birds].sort((a, b) => b.position.z - a.position.z);
+  for (const bird of sorted) {
+    const view = project(lerp(bird.previous, bird.position, alpha), width);
+    const depth = clamp((view.perspective - FAR_SCALE) / (1 - FAR_SCALE), 0, 1);
+    const size = Math.round((DOT_MIN + Math.round((DOT_MAX - DOT_MIN) * depth)) * dotScale);
+    context.fillStyle = `rgb(0,${Math.floor(70 + 185 * depth)},${Math.floor(52 + 148 * depth)})`;
+    context.fillRect(Math.floor(view.x * xScale - size / 2),
+                     Math.floor(view.y * yScale - size / 2), size, size);
+  }
+}
+
+function frame(now) {
+  if (lastFrame !== null && !document.hidden) {
+    accumulator += Math.min((now - lastFrame) / 1000, 0.1);
+    const mouse = avoidPointer && pointer ? {
+      x: pointer.x * width / canvas.clientWidth,
+      y: pointer.y * HEIGHT / canvas.clientHeight
+    } : null;
+    while (accumulator >= STEP) {
+      stepFlock(birds, width, time, mouse);
+      time += STEP;
+      accumulator -= STEP;
+    }
+  }
+  lastFrame = now;
+  draw(accumulator / STEP);
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener('resize', resize);
+window.addEventListener('mousemove', event => { pointer = { x: event.clientX, y: event.clientY }; });
+canvas.addEventListener('mouseleave', () => { pointer = null; });
+window.addEventListener('blur', () => { pointer = null; });
+window.addEventListener('keydown', event => {
+  if (event.code === 'Space' && !event.repeat) {
+    event.preventDefault();
+    avoidPointer = !avoidPointer;
+  }
+});
+document.addEventListener('visibilitychange', () => {
+  lastFrame = null;
+  if (document.hidden) pointer = null;
+});
+resize();
+requestAnimationFrame(frame);
+</script>
+</html>
